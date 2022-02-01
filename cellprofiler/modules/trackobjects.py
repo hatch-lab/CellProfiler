@@ -13,12 +13,15 @@ from cellprofiler_core.constants.measurement import (
     EXPERIMENT,
     MCA_AVAILABLE_EACH_CYCLE,
     IMAGE_NUMBER,
+    IMAGE,
 )
+from cellprofiler_core.object import Objects
 from cellprofiler_core.constants.module import HELP_ON_MEASURING_DISTANCES
 from cellprofiler_core.setting.choice import Choice
+from cellprofiler_core.setting import Binary
 from cellprofiler_core.setting.range import FloatRange
-from cellprofiler_core.setting.subscriber import LabelSubscriber
-from cellprofiler_core.setting.text import Integer, Float, ImageName
+from cellprofiler_core.setting.subscriber import LabelSubscriber, ImageSubscriber
+from cellprofiler_core.setting.text import Integer, Float, ImageName, LabelName
 
 from cellprofiler.modules import _help
 from cellprofiler.modules._help import PROTIP_RECOMMEND_ICON
@@ -195,7 +198,9 @@ TM_OVERLAP = "Overlap"
 TM_DISTANCE = "Distance"
 TM_MEASUREMENTS = "Measurements"
 TM_LAP = "LAP"
-TM_ALL = [TM_OVERLAP, TM_DISTANCE, TM_MEASUREMENTS, TM_LAP]
+TM_FOLLOW_NEIGHBORS = "Follow Neighbors"
+TM_KIT = "KIT 2021"
+TM_ALL = [TM_OVERLAP, TM_DISTANCE, TM_MEASUREMENTS, TM_LAP, TM_FOLLOW_NEIGHBORS, TM_KIT]
 RADIUS_STD_SETTING_TEXT = "Number of standard deviations for search radius"
 RADIUS_LIMIT_SETTING_TEXT = "Search radius limit, in pixel units (Min,Max)"
 ONLY_IF_2ND_PHASE_LAP_TEXT = (
@@ -245,15 +250,24 @@ from centrosome.index import Indexes
 from cellprofiler.modules._help import PROTIP_RECOMMEND_ICON
 
 # if neighmovetrack is not available remove it from options
-TM_ALL = ["Overlap", "Distance", "Measurements", "LAP", "Follow Neighbors"]
-
 try:
     from centrosome.neighmovetrack import (
         NeighbourMovementTracking,
         NeighbourMovementTrackingParameters,
     )
 except:
-    TM_ALL.remove("Follow Neighbors")
+    TM_ALL.remove(TM_FOLLOW_NEIGHBORS)
+
+# if gurobi is not installed, remove it from options
+try:
+    import gurobipy as gp
+    from tracker.extract_data import get_indices_pandas
+    from tracker.postprocessing import add_dummy_masks, untangle_tracks
+    from tracker.graph import graph_tracking
+    from tracker.tracking import Tracklet
+    from tracker.export import catch_tra_issues, create_tracking_mask_image
+except:
+    TM_ALL.remove(TM_KIT)
 
 DT_COLOR_AND_NUMBER = "Color and Number"
 DT_COLOR_ONLY = "Color Only"
@@ -350,7 +364,7 @@ F_ALL = [feature for feature, coltype in F_ALL_COLTYPE_ALL]
 F_IMAGE_ALL = [feature for feature, coltype in F_IMAGE_COLTYPE_ALL]
 
 
-class TrackObjects(Module):
+class TrackObjects(Module):  
     module_name = "TrackObjects"
     category = "Object Processing"
     variable_revision_number = 7
@@ -477,6 +491,27 @@ is most consistent from frame to frame of your movie.
    Mroz, Adam Kaczmarek and Szymon Stoma. Please reach us at `Scopem,
    ETH <http://www.let-your-data-speak.com/>`__ for inquires.
 
+- *KIT 2021:* Use the graph-based tracking algorithm developed by 
+   Löffler, Scherr, & Ralf (*Löffler, Scherr, & Ralf, 2021*).
+
+   Tracks are constructed in a multi-step fashion:
+   1) tracklets from an image sequence are constructed using an ROI
+   around each object, derived from the average size of the segmentation
+   masks. This ROI is used to find objects which could belong to the same
+   track in subsequent frames, and is propogated over time by phase 
+   correlation.
+   2) Tracklets are modeled as a directed graph, with objects being nodes.
+   The graph models cell behavior: appearance, disappearance, movement, 
+   mitosis, and segmentation errors. Optimal paths are found through this
+   graph to link segmented objects over time.
+   3) After matching, tracks can be assigned to more than one predecessor
+   and more than two successors. These tracks are resolved, so that each
+   track has at most on predecessor and at most two successors, to model
+   mitosis.
+   4) Finally, segmentation masks are added to tracks with missing masks.
+   The last available segmentation mask is placed at the computed position
+   it should exist by linear interpolation.
+
 References
 ^^^^^^^^^^
 
@@ -488,6 +523,10 @@ References
   cellular dynamics: a case study based on particle tracking." Cold
   Spring Harb Protoc. 2009(12):pdb.top65.
   `(link) <https://doi.org/10.1101/pdb.top65>`__
+-  Löffler K, Scherr T, Ralf M. (2021) "A graph-based cell tracking
+  algorithm with few manually tunable parameters and automated
+  segmentation error correction." PLoS One. 2021 16(9).
+  `(link) <https://doi.org/10.1371/journal.pone.0249257>`__
 
 .. |image0| image:: {PROTIP_RECOMMEND_ICON}
 .. |image1| image:: {PROTIP_RECOMMEND_ICON}
@@ -501,6 +540,12 @@ References
             "Select the objects to track",
             "None",
             doc="""Select the objects to be tracked by this module.""",
+        )
+
+        self.input_image_name = ImageSubscriber(
+            "Select the images to track",
+            "None",
+            doc="""Select the images to be tracked by this module.""",
         )
 
         self.measurement = Measurement(
@@ -924,6 +969,57 @@ find an object in one or more frames.
             ),
         )
 
+        self.new_object_name = LabelName(
+            "Name the output object",
+            "TrackedObjects",
+            doc="""\
+*(Used only if "%(TM_KIT)s" tracking method is applied)*
+
+The name of the segmented, tracked objects
+"""
+            % globals(),
+        )
+
+        self.roi_size = Float(
+            "ROI size",
+            2.0,
+            minval=0.1,
+            doc="""\
+*(Used only if "%(TM_KIT)s" tracking method is applied)*
+
+The search region used to connect objects between time points. This
+is a factor multiplied by the average size of object segments. Eg,
+setting this to 2.0 means an object will be linked with objects in
+a subsequent time point within a region 2x the size of the average
+object size.
+"""
+            % globals(),
+        )
+
+        self.gap_size = Integer(
+            "Gap size",
+            2,
+            minval=1,
+            maxval=9,
+            doc="""\
+*(Used only if "%(TM_KIT)s" tracking method is applied)*
+
+The maximum gap size to allow when merging objects.
+"""
+            % globals(),
+        )
+
+        self.allow_mitosis = Binary(
+            "Allow mitosis",
+            "Yes",
+            doc="""\
+*(Used only if "%(TM_KIT)s" tracking method is applied)*
+
+The maximum gap size to allow when merging objects.
+"""
+            % globals(),
+        )
+
         self.average_cell_diameter = Float(
             "Average cell diameter in pixels",
             35.0,
@@ -1096,6 +1192,7 @@ Enter a name to give the color-coded image of tracked labels.""",
         return [
             self.tracking_method,
             self.object_name,
+            self.input_image_name,
             self.measurement,
             self.pixel_radius,
             self.display_type,
@@ -1123,12 +1220,16 @@ Enter a name to give the color-coded image of tracked labels.""",
             self.advanced_parameters,
             self.drop_cost,
             self.area_weight,
+            self.new_object_name,
+            self.roi_size,
+            self.gap_size,
+            self.allow_mitosis,
         ]
 
     def validate_module(self, pipeline):
         """Make sure that the user has selected some limits when filtering"""
         if (
-            self.tracking_method == "LAP"
+            self.tracking_method == TM_LAP
             and self.wants_lifetime_filtering.value
             and (
                 self.wants_minimum_lifetime.value == False
@@ -1142,9 +1243,9 @@ Enter a name to give the color-coded image of tracked labels.""",
 
     def visible_settings(self):
         result = [self.tracking_method, self.object_name]
-        if self.tracking_method == "Measurements":
+        if self.tracking_method == TM_MEASUREMENTS:
             result += [self.measurement]
-        if self.tracking_method == "LAP":
+        if self.tracking_method == TM_LAP:
             result += [self.model, self.radius_std, self.radius_limit]
             result += [self.wants_second_phase]
             if self.wants_second_phase:
@@ -1159,10 +1260,12 @@ Enter a name to give the color-coded image of tracked labels.""",
                     self.max_frame_distance,
                     self.mitosis_max_distance,
                 ]
+        elif self.tracking_method == TM_KIT:
+            result += [ self.input_image_name, self.new_object_name, self.gap_size, self.roi_size, self.allow_mitosis ]
         else:
             result += [self.pixel_radius]
 
-        if self.tracking_method == "Follow Neighbors":
+        if self.tracking_method == TM_FOLLOW_NEIGHBORS:
             result += [self.average_cell_diameter, self.advanced_parameters]
             if self.advanced_parameters:
                 result += [self.drop_cost, self.area_weight]
@@ -1279,17 +1382,19 @@ Enter a name to give the color-coded image of tracked labels.""",
         d = self.get_dictionary(workspace.image_set_list)
         d.clear()
 
+        self.kit_tracker = KITTracker(self.roi_size.value, self.gap_size.value, self.allow_mitosis.value)
+
         return True
 
     def measurement_name(self, feature):
         """Return a measurement name for the given feature"""
-        if self.tracking_method == "LAP":
+        if self.tracking_method == TM_LAP:
             return "%s_%s" % (F_PREFIX, feature)
         return "%s_%s_%s" % (F_PREFIX, feature, str(self.pixel_radius.value))
 
     def image_measurement_name(self, feature):
         """Return a measurement name for an image measurement"""
-        if self.tracking_method == "LAP":
+        if self.tracking_method == TM_LAP:
             return "%s_%s_%s" % (F_PREFIX, feature, self.object_name.value)
         return "%s_%s_%s_%s" % (
             F_PREFIX,
@@ -1314,17 +1419,21 @@ Enter a name to give the color-coded image of tracked labels.""",
         workspace.measurements.add_image_measurement(measurement_name, value)
 
     def run(self, workspace):
+
         objects = workspace.object_set.get_objects(self.object_name.value)
-        if self.tracking_method == "Distance":
+        image = workspace.image_set.get_image(self.input_image_name.value)
+        if self.tracking_method == TM_DISTANCE:
             self.run_distance(workspace, objects)
-        elif self.tracking_method == "Overlap":
+        elif self.tracking_method == TM_OVERLAP:
             self.run_overlap(workspace, objects)
-        elif self.tracking_method == "Measurements":
+        elif self.tracking_method == TM_MEASUREMENTS:
             self.run_measurements(workspace, objects)
-        elif self.tracking_method == "LAP":
+        elif self.tracking_method == TM_LAP:
             self.run_lapdistance(workspace, objects)
-        elif self.tracking_method == "Follow Neighbors":
+        elif self.tracking_method == TM_FOLLOW_NEIGHBORS:
             self.run_followneighbors(workspace, objects)
+        elif self.tracking_method == TM_KIT:
+            self.run_kit(workspace, image, objects)
         else:
             raise NotImplementedError(
                 "Unimplemented tracking method: %s" % self.tracking_method.value
@@ -1562,6 +1671,10 @@ Enter a name to give the color-coded image of tracked labels.""",
             #
             # Linear assignment setup
             #
+            n = len(old_i) + len(new_i)
+            kk = np.zeros((n + 10) * (n + 10), np.int32)
+            first = np.zeros(n + 10, np.int32)
+            cc = np.zeros((n + 10) * (n + 10), np.float)
             t = np.argwhere((d < minDist))
             x = np.sqrt(
                 (old_i[t[0 : t.size, 0]] - new_i[t[0 : t.size, 1]]) ** 2
@@ -1760,6 +1873,18 @@ Enter a name to give the color-coded image of tracked labels.""",
                     values = kalman_state.state_cov[:, i, j]
                     m.add_measurement(object_name, mname, values)
 
+    def run_kit(self, workspace, image, objects):
+        """Track objects using KIT graph-based method"""
+        current_labels = objects.segmented
+        y = Objects()
+        y.segmented = current_labels
+        y.parent_image = image
+        new_objects = workspace.object_set
+        new_objects.add_objects(y, self.new_object_name.value)
+        # Run the tracker
+        self.kit_tracker.tracking_step(image.image, current_labels, workspace)
+        
+
     def run_overlap(self, workspace, objects):
         """Track objects by maximum # of overlapping pixels"""
         current_labels = objects.segmented
@@ -1784,17 +1909,17 @@ Enter a name to give the color-coded image of tracked labels.""",
                 histogram = scipy.sparse.coo_matrix(
                     (np.ones(count), (cur, old)), shape=(cur_count + 1, old_count + 1)
                 ).toarray()
-                old_of_new = np.argmax(histogram, 1)[1:]
-                new_of_old = np.argmax(histogram, 0)[1:]
+                old_to_new = np.argmax(histogram, 1)[1:]
+                new_to_old = np.argmax(histogram, 0)[1:]
                 #
                 # The cast here seems to be needed to make scipy.ndimage.sum
                 # work. See http://projects.scipy.org/numpy/ticket/1012
                 #
-                old_of_new = np.array(old_of_new, np.int16)
-                old_of_new = np.array(old_of_new, np.int32)
-                new_of_old = np.array(new_of_old, np.int16)
-                new_of_old = np.array(new_of_old, np.int32)
-                self.map_objects(workspace, new_of_old, old_of_new, i, j)
+                old_to_new = np.array(old_to_new, np.int16)
+                old_to_new = np.array(old_to_new, np.int32)
+                new_to_old = np.array(new_to_old, np.int16)
+                new_to_old = np.array(new_to_old, np.int32)
+                self.map_objects(workspace, new_to_old, old_to_new, i, j)
         self.set_saved_labels(workspace, current_labels)
 
     def run_measurements(self, workspace, objects):
@@ -1867,7 +1992,187 @@ Enter a name to give the color-coded image of tracked labels.""",
     def post_group(self, workspace, grouping):
         # If any tracking method other than LAP, recalculate measurements
         # (Really, only the final age needs to be re-done)
-        image_numbers = self.get_group_image_numbers(workspace)
+        if self.tracking_method == TM_KIT:
+
+            def get_center_of_mass(indices):
+                return np.sum(indices)/indices.size
+
+            self.kit_tracker.finish()
+
+            object_name = self.object_name.value
+
+            objects = workspace.object_set.get_objects(object_name)
+            img_shape = objects.segmented.shape
+
+            tracks_in_frame = {}
+
+            for track_data in self.kit_tracker.tracks.values():
+                time_steps = sorted(list(track_data.masks.keys()))
+                for t_step in time_steps:
+                    if t_step not in tracks_in_frame:
+                        tracks_in_frame[t_step] = []
+                    tracks_in_frame[t_step].append(track_data.track_id)
+
+            all_distances = {}
+            first_coords = {}
+            for time, track_ids in tracks_in_frame.items():
+                tracking_mask = create_tracking_mask_image(self.kit_tracker.tracks, time, track_ids, img_shape)
+
+                objects = self.kit_tracker.workspaces[time].object_set.get_objects(self.new_object_name.value)
+                objects.segmented = tracking_mask
+
+                m = self.kit_tracker.workspaces[time].measurements
+                assert isinstance(m, Measurements)
+
+                labels = []
+                parent_labels = []
+                locations_x = []
+                locations_y = []
+                final_ages = []
+                lifetimes = []
+                trajectories_x = []
+                trajectories_y = []
+                distances = []
+                integrated_distances = []
+                displacements = []
+                linearities = []
+
+                for track_id in np.unique(tracking_mask):
+                    if track_id == 0:
+                        continue
+
+                    labels.append(track_id)
+                    
+                    track = self.kit_tracker.tracks[track_id]
+                    x = get_center_of_mass(track.masks[time][0])
+                    y = get_center_of_mass(track.masks[time][1])
+
+                    locations_x.append(x)
+                    locations_y.append(y)
+
+                    lifetime = np.array(list(track.mask_labels.keys()))
+
+                    # The total duration of this track
+                    final_ages.append(lifetime.size)
+
+                    # The duration of this track at [time]
+                    lifetimes.append(lifetime[lifetime <= time].size)
+
+                    # The distance travelled between [time] and [time-1]
+                    if (time-1) in track.mask_labels.keys():
+                        old_x = get_center_of_mass(track.masks[time-1][0])
+                        old_y = get_center_of_mass(track.masks[time-1][1])
+                        parent_labels.append(track_id)
+                    else:
+                        old_x = x
+                        old_y = y
+                        parent_labels.append(0)
+
+                    trajectories_x.append(x-old_x)
+                    trajectories_y.append(y-old_y)
+                    distance = np.sqrt((x-old_x) ** 2 + (y-old_y) ** 2)
+                    distances.append(distance)
+
+                    if track_id not in all_distances.keys():
+                        all_distances[track_id] = []
+                        first_coords[track_id] = (x, y)
+                    all_distances[track_id].append(distance)
+
+                    # The total distance travelled at [time]
+                    integrated_distances.append(np.sum(all_distances[track_id]))
+
+                    # The total distance travelled as the crow flies at [time]
+                    displacements.append(np.sqrt((x-first_coords[track_id][0]) ** 2 + (y-first_coords[track_id][1]) ** 2))
+
+                # How linear the travel was
+                linearities = np.true_divide(displacements, integrated_distances)
+
+                m.add_measurement(
+                    self.new_object_name.value,
+                    self.measurement_name(F_LABEL),
+                    labels,
+                    image_set_number=time,
+                )
+
+                m.add_measurement(
+                    object_name,
+                    self.measurement_name(F_PARENT_OBJECT_NUMBER),
+                    parent_labels,
+                    image_set_number=time,
+                )
+
+                m.add_measurement(
+                    object_name,
+                    self.measurement_name(F_PARENT_IMAGE_NUMBER),
+                    [time-1]*len(labels),
+                    image_set_number=time,
+                )
+
+                m.add_measurement(
+                    self.new_object_name.value,
+                    self.measurement_name(M_LOCATION_CENTER_X),
+                    locations_x,
+                    image_set_number=time,
+                )
+
+                m.add_measurement(
+                    self.new_object_name.value,
+                    self.measurement_name(M_LOCATION_CENTER_Y),
+                    locations_y,
+                    image_set_number=time,
+                )
+
+                m.add_measurement(
+                    object_name,
+                    self.measurement_name(F_FINAL_AGE),
+                    final_ages,
+                    image_set_number=time,
+                )
+                m.add_measurement(
+                    object_name,
+                    self.measurement_name(F_LIFETIME),
+                    lifetimes,
+                    image_set_number=time,
+                )
+
+                m.add_measurement(
+                    object_name,
+                    self.measurement_name(F_TRAJECTORY_X),
+                    trajectories_x,
+                    image_set_number=time,
+                )
+                m.add_measurement(
+                    object_name,
+                    self.measurement_name(F_TRAJECTORY_Y),
+                    trajectories_y,
+                    image_set_number=time,
+                )
+                m.add_measurement(
+                    object_name,
+                    self.measurement_name(F_DISTANCE_TRAVELED),
+                    distances,
+                    image_set_number=time,
+                )
+                m.add_measurement(
+                    object_name,
+                    self.measurement_name(F_DISPLACEMENT),
+                    displacements,
+                    image_set_number=time,
+                )
+                m.add_measurement(
+                    object_name,
+                    self.measurement_name(F_INTEGRATED_DISTANCE),
+                    integrated_distances,
+                    image_set_number=time,
+                )
+                m.add_measurement(
+                    object_name,
+                    self.measurement_name(F_LINEARITY),
+                    linearities,
+                    image_set_number=time,
+                )
+            return
+
         if self.tracking_method != "LAP":
             m = workspace.measurements
             assert isinstance(m, Measurements)
@@ -1917,7 +2222,7 @@ Enter a name to give the color-coded image of tracked labels.""",
         ]
         group_indices, new_object_count, lost_object_count, merge_count, split_count = [
             np.array(
-                [m.get_measurement("Image", feature, i) or 0 for i in image_numbers], int,
+                [m.get_measurement("Image", feature, i) for i in image_numbers], int,
             )
             for feature in (
                 GROUP_INDEX,
@@ -3188,32 +3493,32 @@ Enter a name to give the color-coded image of tracked labels.""",
                 F_EXPT_FILT_NUMTRACKS, nlabels - len(labels_to_filter)
             )
 
-    def map_objects(self, workspace, new_of_old, old_of_new, i, j):
+    def map_objects(self, workspace, new_to_old, old_to_new, i, j):
         """Record the mapping of old to new objects and vice-versa
 
         workspace - workspace for current image set
-        new_of_old - an array of the new labels for every old label
-        old_of_new - an array of the old labels for every new label
+        new_to_old - an array of the new labels for every old label
+        old_to_new - an array of the old labels for every new label
         i, j - the coordinates for each new object.
         """
         m = workspace.measurements
         assert isinstance(m, Measurements)
         image_number = m.get_current_image_measurement(IMAGE_NUMBER)
-        new_of_old = new_of_old.astype(int)
-        old_of_new = old_of_new.astype(int)
+        new_to_old = new_to_old.astype(int)
+        old_to_new = old_to_new.astype(int)
         old_object_numbers = self.get_saved_object_numbers(workspace).astype(int)
         max_object_number = self.get_max_object_number(workspace)
-        old_count = len(new_of_old)
-        new_count = len(old_of_new)
+        old_count = len(new_to_old)
+        new_count = len(old_to_new)
         #
         # Record the new objects' parents
         #
-        parents = old_of_new.copy()
+        parents = old_to_new.copy()
         parents[parents != 0] = old_object_numbers[
-            (old_of_new[parents != 0] - 1)
+            (old_to_new[parents != 0] - 1)
         ].astype(parents.dtype)
-        self.add_measurement(workspace, F_PARENT_OBJECT_NUMBER, old_of_new)
-        parent_image_numbers = np.zeros(len(old_of_new))
+        self.add_measurement(workspace, F_PARENT_OBJECT_NUMBER, old_to_new)
+        parent_image_numbers = np.zeros(len(old_to_new))
         parent_image_numbers[parents != 0] = image_number - 1
         self.add_measurement(workspace, F_PARENT_IMAGE_NUMBER, parent_image_numbers)
         #
@@ -3221,11 +3526,11 @@ Enter a name to give the color-coded image of tracked labels.""",
         #
         mapping = np.zeros(new_count, int)
         if old_count > 0 and new_count > 0:
-            mapping[old_of_new != 0] = old_object_numbers[
-                old_of_new[old_of_new != 0] - 1
+            mapping[old_to_new != 0] = old_object_numbers[
+                old_to_new[old_to_new != 0] - 1
             ]
-            miss_count = np.sum(old_of_new == 0)
-            lost_object_count = np.sum(new_of_old == 0)
+            miss_count = np.sum(old_to_new == 0)
+            lost_object_count = np.sum(new_to_old == 0)
         else:
             miss_count = new_count
             lost_object_count = old_count
@@ -3251,9 +3556,9 @@ Enter a name to give the color-coded image of tracked labels.""",
         old_i, old_j = self.get_saved_coordinates(workspace)
         old_distance = self.get_saved_distances(workspace)
         old_orig_i, old_orig_j = self.get_orig_coordinates(workspace)
-        has_old = old_of_new != 0
+        has_old = old_to_new != 0
         if np.any(has_old):
-            old_indexes = old_of_new[has_old] - 1
+            old_indexes = old_to_new[has_old] - 1
             orig_i[has_old] = old_orig_i[old_indexes]
             orig_j[has_old] = old_orig_j[old_indexes]
             diff_i[has_old] = i[has_old] - old_i[old_indexes]
@@ -3280,7 +3585,7 @@ Enter a name to give the color-coded image of tracked labels.""",
         age = np.ones(new_count, int)
         if np.any(has_old):
             old_age = self.get_saved_ages(workspace)
-            age[has_old] = old_age[old_of_new[has_old] - 1] + 1
+            age[has_old] = old_age[old_to_new[has_old] - 1] + 1
         self.add_measurement(workspace, F_LIFETIME, age)
         final_age = np.NaN * np.ones(
             new_count, float
@@ -3306,8 +3611,8 @@ Enter a name to give the color-coded image of tracked labels.""",
         #
         # Find children with more than one parent. These are the merges
         #
-        if np.any(new_of_old != 0):
-            h = np.bincount(new_of_old[new_of_old != 0])
+        if np.any(new_to_old != 0):
+            h = np.bincount(new_to_old[new_to_old != 0])
             merge_count = np.sum(h > 1)
         else:
             merge_count = 0
@@ -3317,13 +3622,13 @@ Enter a name to give the color-coded image of tracked labels.""",
         # Compile the relationships between children and parents
         #
         #########################################
-        last_object_numbers = np.arange(1, len(new_of_old) + 1)
-        new_object_numbers = np.arange(1, len(old_of_new) + 1)
+        last_object_numbers = np.arange(1, len(new_to_old) + 1)
+        new_object_numbers = np.arange(1, len(old_to_new) + 1)
         r_parent_object_numbers = np.hstack(
-            (old_of_new[old_of_new != 0], last_object_numbers[new_of_old != 0])
+            (old_to_new[old_to_new != 0], last_object_numbers[new_to_old != 0])
         )
         r_child_object_numbers = np.hstack(
-            (new_object_numbers[parents != 0], new_of_old[new_of_old != 0])
+            (new_object_numbers[parents != 0], new_to_old[new_to_old != 0])
         )
         if len(r_child_object_numbers) > 0:
             #
@@ -3683,3 +3988,227 @@ Enter a name to give the color-coded image of tracked labels.""",
             variable_revision_number = 7
 
         return setting_values, variable_revision_number
+
+class CellTrack:
+  """Contains the information of a single cell track"""
+  def __init__(self, track_id, pred_track_id=[0]):
+    self.track_id = track_id
+    self.pred_track_id = pred_track_id
+    self.successors = set()
+    self.masks = {}
+    self.last_assigned_obj = None
+    self.mask_labels = {}
+
+  def add_time_step(self, mask_id, mask_indices):
+    """
+    Add segmented object to the track.
+    Args:
+      mask_id: tuple providing the time point and the segmentation mask index
+      mask_indices: tuple of segmentation mask pixel positions
+    """
+    time, mask_label = mask_id
+    self.masks[time] = mask_indices
+    self.last_assigned_obj = mask_id
+    self.mask_labels[time] = mask_label
+
+  def get_last_position(self):
+    last_time = sorted(list(self.masks.keys()))[-1]
+    return np.median(np.stack(self.masks[last_time]), axis=-1)
+
+  def get_first_position(self):
+    first_time = sorted(list(self.masks.keys()))[0]
+    return np.median(np.stack(self.masks[first_time]), axis=-1)
+
+  def get_last_time(self):
+    return sorted(list(self.masks.keys()))[-1]
+
+class KITTracker():
+  """Tracks multiple potentially splitting objects over time."""
+  def __init__(self, default_roi_size, delta_t, allow_mitosis="Yes"):
+    """
+    Initialises multi object tracker.
+    Args:
+        config: an instance of type TrackingConfig containing the parametrisation for the tracking algorithm
+    """
+
+    allow_mitosis = (allow_mitosis == "Yes")
+    self.cell_rois = {}
+    self.tracklets = {}
+    self.tracks = {}
+    self.last_assigned_object = {}
+    self.mapping_objects_tracks = {}
+    self.segmentation_masks = {}
+    self.img_shape = None
+    self.config = {
+      'delta_t': delta_t,
+      'default_roi_size': default_roi_size,
+      'roi_box_size': None,
+      'cut_off_distance': None,
+      'allow_cell_division': allow_mitosis
+    }
+    self.time = 1
+    self.delta_t = delta_t
+    self.workspaces = {}
+
+  def tracking_step(self, image, mask, workspace):
+    """Applies a single tracking step."""
+    if self.config['roi_box_size'] is None:
+      masks = get_indices_pandas(mask)
+      m_shape = np.stack(masks.apply(lambda x: np.max(np.array(x), axis=-1) - np.min(np.array(x), axis=-1) +1))
+
+      if len(image.shape) == 2:
+        if len(masks) > 10:
+          m_size = np.median(np.stack(m_shape)).astype(int)
+          self.config['roi_box_size'] = tuple([m_size*self.config['default_roi_size'], m_size*self.config['default_roi_size']])
+        else:
+          self.config['roi_box_size'] = tuple((np.array(image.shape) // 10).astype(int))
+      else:
+        self.config['roi_box_size'] = tuple((np.median(np.stack(m_shape), axis=0) * self.config['default_roi_size']).astype(int))
+
+    if self.config['cut_off_distance'] is None:
+      self.config['cut_off_distance'] = max(self.config['roi_box_size'])/2
+
+    self.propagate_tracklets(image, mask)
+    if ((self.time-1) % self.delta_t == 0) & (self.time > 1):
+      self.matching_step()  # match objects
+      # remove tracklets
+      tracklets_to_pop = set(self.tracklets.keys()).difference(self.last_assigned_object.values())
+      for tracklet_id in tracklets_to_pop:
+        self.tracklets.pop(tracklet_id)
+      succ_tracklets = list(filter(lambda x: len(self.tracks[self.mapping_objects_tracks[x]].successors) > 0,
+                                   self.tracklets.keys()))
+      old_tracklets = list(filter(lambda x: x[0] <= self.time - self.delta_t,
+                                  self.tracklets.keys()))
+      tracklets_to_remove = old_tracklets
+      tracklets_to_remove.extend(succ_tracklets)
+
+      for tracklet_id in set(tracklets_to_remove):
+        self.tracklets.pop(tracklet_id)
+      # remove matching candidates
+      for tracklet_id in self.tracklets.keys():
+        self.tracklets[tracklet_id].matching_candidates = set()
+
+    self.workspaces[self.time] = workspace
+    self.time += 1
+
+  def propagate_tracklets(self, image, segmentation):
+    """Propagates object position and features over time."""
+    if self.img_shape is None:
+      self.img_shape = image.shape
+
+    time = self.time
+
+    mask_indices = get_indices_pandas(segmentation)
+
+    # initialize tracklets
+    for m_id in mask_indices.index.values:
+      mask = mask_indices[m_id]
+      coords = list(zip(mask[0], mask[1]))
+      m = np.array(mask)
+      box_shape = np.max(m, axis=-1) - np.min(m, axis=-1) + 1
+      box_shape = [max(a, b) for a, b in zip(box_shape, self.config['roi_box_size'])]
+      self.tracklets[(time, m_id)] = Tracklet(m_id, time, mask, box_shape, self.delta_t)
+      self.tracklets[(time, m_id)].init_img_patch(time, image)
+
+    # update tracklets from previous time steps
+    selected_tracklets = filter(lambda x: x[0] < time, self.tracklets.keys())
+    for tracklet_key in selected_tracklets:
+      tracklet = self.tracklets[tracklet_key]
+      if (time - tracklet.t_start) <= self.delta_t:
+
+        if time not in tracklet.time_steps:
+          tracklet.propagate(time, image)
+        # add potential matching candidates
+        coords = tracklet.roi.last_roi_crop_box(self.img_shape)
+        mask_ids = segmentation[coords]
+        mask_ids = np.unique(mask_ids[mask_ids > 0])
+        if len(tracklet.roi.roi) > 1:
+          prev_roi = tracklet.roi.roi[sorted(tracklet.roi.roi.keys())[-2]].crop_box(self.img_shape)
+          mask_ids_prev_roi = segmentation[prev_roi]
+          mask_ids_prev_roi = np.unique(mask_ids_prev_roi[mask_ids_prev_roi > 0])
+          mask_ids = np.unique(np.hstack([mask_ids, mask_ids_prev_roi]))
+
+        if len(mask_ids) > 0:
+          n_matching_candidates = {(time, n_id) for n_id in mask_ids}
+          tracklet.add_matching_candidates(n_matching_candidates)
+  
+  def matching_step(self):
+    """Matches tracks from previous time points to objects at current time point."""
+    potential_matching_candidates = {t_id: tracklet.matching_candidates
+                                     for t_id, tracklet in self.tracklets.items()}
+    tracklet_features = {t_id: tracklet.all_features()
+                         for t_id, tracklet in self.tracklets.items()}
+
+    # match objects using coupled min cost flow
+    # matches: segm_id: ([matched track_ids], is_cell_division)
+    ad_costs = self.config['cut_off_distance']
+    matches = graph_tracking(tracklet_features, potential_matching_candidates,
+                             self.img_shape,
+                             cutoff_distance=ad_costs,
+                             allow_cell_division=self.config['allow_cell_division'])
+
+    # add selected objects to tracks
+    for match in matches.values():
+      # case no predecessor
+      if match['pred_track_id']:
+        # split case/ merge case
+        self.init_new_track(match)
+      else:
+        # new track
+        segm_id = tuple([int(el) for el in match['track'][0].split('_')])
+        if segm_id not in self.mapping_objects_tracks.keys():
+          self.init_new_track(match)
+        # append track
+        else:
+          track_id = self.mapping_objects_tracks[segm_id]
+          self.append_to_track(track_id, match)
+    # update last assigned object
+    self.last_assigned_object = {t_id: track.last_assigned_obj
+                                 for t_id, track in self.tracks.items()}
+
+  def init_new_track(self, mapped_objects):
+    """
+    Creates a new track.
+    Args:
+        mapped_objects: dict contains predecessor/ successor information and
+        which segmented objects have been assigned to track
+    """
+    if self.tracks.keys():
+      track_id = max(list(self.tracks.keys())) + 1
+    else:
+      track_id = 1  # start with 1 as background is 0, no predecessor is 0
+    if mapped_objects['pred_track_id']:
+      pred_ids = [tuple([int(e) for e in el.split('_')])
+                  for el in mapped_objects['predecessor']]
+      pred_track_id = [self.mapping_objects_tracks[pred] for pred in pred_ids
+                       if pred in self.mapping_objects_tracks]
+
+      for t_id in pred_track_id:
+        self.tracks[t_id].successors.add(track_id)
+    else:
+      pred_track_id = [0]
+    if pred_track_id:
+      self.tracks[track_id] = CellTrack(track_id, pred_track_id)
+      self.append_to_track(track_id, mapped_objects)
+
+  def append_to_track(self, track_id, mapped_objects):
+    """
+    Appends set of segmented objects to an existing track.
+    Args:
+        track_id: int providing the tracking id the segmented objects shall be assigned to
+        mapped_objects: dict contains predecessor/ successor information and
+        which segmented objects have been assigned to track
+    """
+    tracklet_ids = [tuple([int(e) for e in el.split('_')]) for el in mapped_objects['track']]
+    for tracklet_id in tracklet_ids:
+      self.mapping_objects_tracks[tracklet_id] = track_id
+      self.tracks[track_id].add_time_step(tracklet_id, self.tracklets[tracklet_id].mask)
+
+
+  def finish(self):
+    if (self.time-1) % self.delta_t:
+      self.matching_step()
+
+    self.tracks = untangle_tracks(self.tracks)
+    self.tracks = add_dummy_masks(self.tracks, self.img_shape)
+    self.tracks = catch_tra_issues(self.tracks, list(range(1,self.time)))
