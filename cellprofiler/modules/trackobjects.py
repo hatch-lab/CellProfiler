@@ -1388,7 +1388,7 @@ Enter a name to give the color-coded image of tracked labels.""",
 
     def measurement_name(self, feature):
         """Return a measurement name for the given feature"""
-        if self.tracking_method == TM_LAP:
+        if self.tracking_method == TM_LAP or self.tracking_method == TM_KIT:
             return "%s_%s" % (F_PREFIX, feature)
         return "%s_%s_%s" % (F_PREFIX, feature, str(self.pixel_radius.value))
 
@@ -1396,6 +1396,8 @@ Enter a name to give the color-coded image of tracked labels.""",
         """Return a measurement name for an image measurement"""
         if self.tracking_method == TM_LAP:
             return "%s_%s_%s" % (F_PREFIX, feature, self.object_name.value)
+        elif self.tracking_method == TM_KIT:
+            return "%s_%s_%s" % (F_PREFIX, feature, self.new_object_name.value)
         return "%s_%s_%s_%s" % (
             F_PREFIX,
             feature,
@@ -1421,7 +1423,6 @@ Enter a name to give the color-coded image of tracked labels.""",
     def run(self, workspace):
 
         objects = workspace.object_set.get_objects(self.object_name.value)
-        image = workspace.image_set.get_image(self.input_image_name.value)
         if self.tracking_method == TM_DISTANCE:
             self.run_distance(workspace, objects)
         elif self.tracking_method == TM_OVERLAP:
@@ -1433,6 +1434,7 @@ Enter a name to give the color-coded image of tracked labels.""",
         elif self.tracking_method == TM_FOLLOW_NEIGHBORS:
             self.run_followneighbors(workspace, objects)
         elif self.tracking_method == TM_KIT:
+            image = workspace.image_set.get_image(self.input_image_name.value)
             self.run_kit(workspace, image, objects)
         else:
             raise NotImplementedError(
@@ -1992,6 +1994,8 @@ Enter a name to give the color-coded image of tracked labels.""",
     def post_group(self, workspace, grouping):
         # If any tracking method other than LAP, recalculate measurements
         # (Really, only the final age needs to be re-done)
+        image_numbers = self.get_group_image_numbers(workspace)
+
         if self.tracking_method == TM_KIT:
 
             def get_center_of_mass(indices):
@@ -2018,10 +2022,10 @@ Enter a name to give the color-coded image of tracked labels.""",
             for time, track_ids in tracks_in_frame.items():
                 tracking_mask = create_tracking_mask_image(self.kit_tracker.tracks, time, track_ids, img_shape)
 
-                objects = self.kit_tracker.workspaces[time].object_set.get_objects(self.new_object_name.value)
+                objects = workspace.object_set.get_objects(self.new_object_name.value)
                 objects.segmented = tracking_mask
 
-                m = self.kit_tracker.workspaces[time].measurements
+                m = workspace.measurements
                 assert isinstance(m, Measurements)
 
                 labels = []
@@ -2095,14 +2099,21 @@ Enter a name to give the color-coded image of tracked labels.""",
                 )
 
                 m.add_measurement(
-                    object_name,
+                    IMAGE,
+                    "Count_" + self.new_object_name.value,
+                    len(labels),
+                    image_set_number=time,
+                )
+
+                m.add_measurement(
+                    self.new_object_name.value,
                     self.measurement_name(F_PARENT_OBJECT_NUMBER),
                     parent_labels,
                     image_set_number=time,
                 )
 
                 m.add_measurement(
-                    object_name,
+                    self.new_object_name.value,
                     self.measurement_name(F_PARENT_IMAGE_NUMBER),
                     [time-1]*len(labels),
                     image_set_number=time,
@@ -2123,50 +2134,57 @@ Enter a name to give the color-coded image of tracked labels.""",
                 )
 
                 m.add_measurement(
-                    object_name,
+                    self.new_object_name.value,
                     self.measurement_name(F_FINAL_AGE),
                     final_ages,
                     image_set_number=time,
                 )
                 m.add_measurement(
-                    object_name,
+                    self.new_object_name.value,
                     self.measurement_name(F_LIFETIME),
                     lifetimes,
                     image_set_number=time,
                 )
 
                 m.add_measurement(
-                    object_name,
+                    self.new_object_name.value,
                     self.measurement_name(F_TRAJECTORY_X),
                     trajectories_x,
                     image_set_number=time,
                 )
                 m.add_measurement(
-                    object_name,
+                    self.new_object_name.value,
                     self.measurement_name(F_TRAJECTORY_Y),
                     trajectories_y,
                     image_set_number=time,
                 )
                 m.add_measurement(
-                    object_name,
+                    self.new_object_name.value,
                     self.measurement_name(F_DISTANCE_TRAVELED),
                     distances,
                     image_set_number=time,
                 )
+
                 m.add_measurement(
-                    object_name,
+                    self.new_object_name.value,
                     self.measurement_name(F_DISPLACEMENT),
                     displacements,
                     image_set_number=time,
                 )
                 m.add_measurement(
-                    object_name,
+                    self.new_object_name.value,
                     self.measurement_name(F_INTEGRATED_DISTANCE),
                     integrated_distances,
                     image_set_number=time,
                 )
                 m.add_measurement(
-                    object_name,
+                    self.new_object_name.value,
+                    self.measurement_name(F_LINEARITY),
+                    linearities,
+                    image_set_number=time,
+                )
+                m.add_measurement(
+                    self.new_object_name.value,
                     self.measurement_name(F_LINEARITY),
                     linearities,
                     image_set_number=time,
